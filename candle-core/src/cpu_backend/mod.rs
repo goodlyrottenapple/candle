@@ -1302,6 +1302,15 @@ impl MatMul {
     }
 }
 
+extern "C" {
+    fn matmul_i64(
+        a_cs:i32, a_rs:i32, a: *const i64,
+        b_cs:i32, b_rs:i32, b: *const i64,
+        c_cs:i32, c_rs:i32, c: *mut i64,
+        k: i32, m: i32, n: i32
+    );
+}
+
 impl Map2 for MatMul {
     const OP: &'static str = "mat_mul";
 
@@ -1316,7 +1325,7 @@ impl Map2 for MatMul {
         use gemm::{gemm, Parallelism};
 
         match T::DTYPE {
-            DType::F16 | DType::F32 | DType::F64 => {}
+            DType::F16 | DType::F32 | DType::F64 | DType::I64 => {}
             _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
         }
 
@@ -1361,28 +1370,49 @@ impl Map2 for MatMul {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];
             let dst_p = &mut dst[step * c_skip..];
-            unsafe {
-                gemm(
-                    /* m: usize = */ m,
-                    /* n: usize = */ n,
-                    /* k: usize = */ k,
-                    /* dst: *mut T = */ dst_p.as_mut_ptr(),
-                    /* dst_cs: isize = */ dst_cs as isize,
-                    /* dst_rs: isize = */ dst_rs as isize,
-                    /* read_dst: bool = */ false,
-                    /* lhs: *const T = */ lhs_p.as_ptr(),
-                    /* lhs_cs: isize = */ lhs_cs as isize,
-                    /* lhs_rs: isize = */ lhs_rs as isize,
-                    /* rhs: *const T = */ rhs_p.as_ptr(),
-                    /* rhs_cs: isize = */ rhs_cs as isize,
-                    /* rhs_rs: isize = */ rhs_rs as isize,
-                    /* alpha: T = */ T::zero(),
-                    /* beta: T = */ T::one(),
-                    /* conj_dst: bool = */ false,
-                    /* conj_lhs: bool = */ false,
-                    /* conj_rhs: bool = */ false,
-                    parallelism,
-                )
+
+            match T::DTYPE {
+                DType::I64 => {
+                    unsafe {
+                        matmul_i64(
+                            lhs_cs as i32,
+                            lhs_rs as i32,
+                            lhs_p.as_ptr() as *const i64,
+                            rhs_cs as i32,
+                            rhs_rs as i32,
+                            rhs_p.as_ptr() as *const i64,
+                            dst_cs as i32,
+                            dst_rs as i32,
+                            dst_p.as_mut_ptr() as *mut i64,
+                            k as i32,
+                            m as i32,
+                            n as i32
+                        );
+                    }
+                }
+                _ => unsafe {
+                        gemm(
+                            /* m: usize = */ m,
+                            /* n: usize = */ n,
+                            /* k: usize = */ k,
+                            /* dst: *mut T = */ dst_p.as_mut_ptr(),
+                            /* dst_cs: isize = */ dst_cs as isize,
+                            /* dst_rs: isize = */ dst_rs as isize,
+                            /* read_dst: bool = */ false,
+                            /* lhs: *const T = */ lhs_p.as_ptr(),
+                            /* lhs_cs: isize = */ lhs_cs as isize,
+                            /* lhs_rs: isize = */ lhs_rs as isize,
+                            /* rhs: *const T = */ rhs_p.as_ptr(),
+                            /* rhs_cs: isize = */ rhs_cs as isize,
+                            /* rhs_rs: isize = */ rhs_rs as isize,
+                            /* alpha: T = */ T::zero(),
+                            /* beta: T = */ T::one(),
+                            /* conj_dst: bool = */ false,
+                            /* conj_lhs: bool = */ false,
+                            /* conj_rhs: bool = */ false,
+                            parallelism,
+                        )
+                    }
             }
         }
         Ok(dst)
