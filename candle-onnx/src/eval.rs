@@ -2,7 +2,7 @@ use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
 use candle::Module;
-use candle::{bail, DType, Device, Result, Tensor};
+use candle::{bail, DType, Device, Result, Tensor, IndexOp};
 use candle_nn::activation::PReLU;
 use std::collections::{HashMap, HashSet};
 
@@ -251,6 +251,24 @@ fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>> {
+    simple_eval_init_(graph, values)?;
+    simple_eval_loop_(graph, values)?;
+    // The nodes are topologically sorted so we can just process them in order.
+    graph
+        .output
+        .iter()
+        .map(|output| match values.remove(&output.name) {
+            None => bail!("cannot find output {}", output.name),
+            Some(value) => Ok((output.name.clone(), value)),
+        })
+        .collect()
+}
+#[inline(always)]
+fn simple_eval_init_(
+    graph: &onnx::GraphProto,
+    values: &mut HashMap<String, Value>,
+) -> Result<()>
+{
     for t in graph.initializer.iter() {
         let tensor = get_tensor(t, t.name.as_str())?;
         values.insert(t.name.to_string(), tensor);
@@ -319,7 +337,16 @@ fn simple_eval_(
             )
         }
     }
-    // The nodes are topologically sorted so we can just process them in order.
+    Ok(())
+}
+
+
+#[inline]
+fn simple_eval_loop_(
+    graph: &onnx::GraphProto,
+    values: &mut HashMap<String, Value>,
+) -> Result<()>
+{
     for node in graph.node.iter() {
         let get = |input_name: &str| match values.get(input_name) {
             Some(value) => Ok(value),
@@ -2233,17 +2260,114 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#scan
+            "Scan" => {
+                let body = get_attr::<GraphProto>(node, "body")?;
+                let num_scan_inputs = get_attr::<i64>(node, "num_scan_inputs")?;
+                if num_scan_inputs < &0 {
+                    bail!("attribute num_scan_inputs of type INT has a negative value, which is unsupported")
+                }
+                let scan_input_axes = get_attr_opt::<[i64]>(node, "scan_input_axes")?;
+                match scan_input_axes {
+                    None => (),
+                    Some(_) => bail!("unsupported scan_input_axes"),
+                };
+                let scan_input_directions = get_attr_opt::<[i64]>(node, "scan_input_directions")?;
+                match scan_input_directions {
+                    None => (),
+                    Some(_) => bail!("unsupported scan_input_directions"),
+                };
+                let scan_output_axes = get_attr_opt::<[i64]>(node, "scan_output_axes")?;
+                match scan_output_axes {
+                    None => (),
+                    Some(_) => bail!("unsupported scan_output_axes"),
+                };
+                let scan_output_directions = get_attr_opt::<[i64]>(node, "scan_output_directions")?;
+                match scan_output_directions {
+                    None => (),
+                    Some(_) => bail!("unsupported scan_output_directions"),
+                };
+                let num_inputs = node.input.len();
+                let num_outputs = node.output.len();
+
+                let num_state_inputs = num_inputs - *num_scan_inputs as usize;
+                let num_state_outputs = num_state_inputs;
+
+                if body.input.len() != num_inputs {
+                    bail!("The body must have the same number of inputs as parent")
+                }
+                if body.output.len() != num_outputs {
+                    bail!("The body must have the same number of outputs as parent")
+                }
+
+                let mut scan_values = values.clone();
+
+                for i in 0..num_state_inputs {
+                    scan_values.insert(body.input[i].name.clone(), get(&node.input[i])?.clone());
+                }
+
+                let sequence_length = get(&node.input[num_state_inputs])?.dim(0)?;
+                if sequence_length < 1 {
+                    bail!("The scan_values must have 0th dimension of size >= 1")
+                }
+                node.input[num_state_inputs..]
+                    .iter()
+                    .try_for_each(|inp| {
+                        if get(inp)?.dim(0)? != sequence_length { 
+                            bail!("The dimension along axis 0 must be equal to {}", sequence_length)
+                        }
+                        Ok(())
+                    })?;
+
+                for i in num_state_inputs..num_inputs {
+                    scan_values.insert(body.input[i].name.clone(), get(&node.input[i])?.i(0)?);
+                }
+
+                simple_eval_init_(body, &mut scan_values)?;
+                
+                let mut outputs: Vec<Vec<Value>> = Vec::with_capacity(sequence_length * num_state_outputs);
+
+                for iteration in 0..sequence_length {
+                    simple_eval_loop_(body, &mut scan_values)?;
+
+                    for i in num_state_outputs..num_outputs {
+                        if let Some(output_value) = scan_values.get(&body.output[i].name) {
+                            outputs[i][iteration] = output_value.clone();
+                        }
+                    }
+
+                    if iteration < sequence_length - 1 {
+                        for i in 0..num_state_inputs {
+                            if let Some(output_value) = scan_values.get(&body.output[i].name).map(|x| x.clone()) {
+                                if let Some(input_value) = scan_values.get_mut(&body.input[i].name) {
+                                    *input_value = output_value;
+                                }
+                            }
+                        }
+
+                        for i in num_state_inputs..num_inputs {
+                            if let Some(x) = scan_values.get_mut(&body.input[i].name) {
+                                *x = get(&node.input[i])?.i(iteration + 1)?
+                            }
+                        }
+                    }
+                }
+
+                for i in 0..num_state_outputs {
+                    if let Some(output_value) = scan_values.get(&body.output[i].name) {
+                        values.insert(node.output[i].clone(), output_value.clone());
+                    }
+                }
+
+                for i in num_state_outputs..num_outputs {
+                    let output = Tensor::cat(&outputs[i - num_state_outputs], 0)?;
+                    values.insert(node.output[i].clone(), output);
+                }
+            }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
     }
-    graph
-        .output
-        .iter()
-        .map(|output| match values.remove(&output.name) {
-            None => bail!("cannot find output {}", output.name),
-            Some(value) => Ok((output.name.clone(), value)),
-        })
-        .collect()
+    Ok(())
 }
 
 fn broadcast_shape(shape_a: &[usize], shape_b: &[usize]) -> Result<Vec<usize>> {
